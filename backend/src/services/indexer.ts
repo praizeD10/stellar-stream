@@ -15,6 +15,9 @@ import {
   indexerLedgerLag,
   indexerErrorsTotal,
   indexerCircuitState,
+  indexerEventsDedupedTotal,
+  indexerPollDurationMs,
+  type IndexerPollOutcome,
 } from "./metrics";
 import { logger } from "../logger";
 
@@ -30,6 +33,10 @@ let indexerStartLedger: number | null = null;
 let isIndexing = false;
 let lastObservedLedger: number | null = null;
 let lastFailureKind: IndexerRpcFailureKind | null = null;
+let lastPollOutcome: IndexerPollOutcome | null = null;
+let lastPollDurationMs: number | null = null;
+/** Monotonically incrementing poll cycle counter — used as a lightweight request ID for log correlation. */
+let pollCycleId = 0;
 
 const INDEXER_CURSOR_TABLE = "indexer_cursor";
 const CHECKPOINT_ROW_ID = 1;
@@ -220,6 +227,25 @@ export interface IndexerMonitoringSnapshot {
   lastFailureKind: IndexerRpcFailureKind | null;
   /** Whether a poll is currently in flight. */
   pollInFlight: boolean;
+  /**
+   * Coarse outcome of the most recently completed poll cycle, or null if no
+   * poll has completed yet. Allows operators to distinguish a normal idle state
+   * (`normal_empty`) from a restart-recovery dedup cycle (`restart_recovery`),
+   * an empty ledger range (`empty_range`), and successful event processing
+   * (`events_processed`).
+   */
+  lastPollOutcome?: IndexerPollOutcome | null;
+  /**
+   * Wall-clock duration of the most recently completed poll cycle in
+   * milliseconds. Null before the first poll completes.
+   */
+  lastPollDurationMs?: number | null;
+  /**
+   * Monotonically incrementing ID for the current (or most recently completed)
+   * poll cycle. Use this to correlate log lines emitted during a single cycle.
+   * Zero before the first poll starts.
+   */
+  pollCycleId?: number;
 }
 
 export function getIndexerMonitoringSnapshot(): IndexerMonitoringSnapshot {
@@ -237,6 +263,9 @@ export function getIndexerMonitoringSnapshot(): IndexerMonitoringSnapshot {
     circuitState: circuitBreaker.getState(),
     lastFailureKind,
     pollInFlight: isIndexing,
+    lastPollOutcome,
+    lastPollDurationMs,
+    pollCycleId,
   };
 }
 
@@ -386,6 +415,9 @@ export function resetIndexerState(): void {
   indexerStartLedger = null;
   lastObservedLedger = null;
   lastFailureKind = null;
+  lastPollOutcome = null;
+  lastPollDurationMs = null;
+  pollCycleId = 0;
   circuitBreaker.reset();
 }
 
@@ -404,6 +436,8 @@ async function indexEvents(): Promise<void> {
   }
 
   isIndexing = true;
+  const currentPollCycleId = ++pollCycleId;
+  const pollStartMs = Date.now();
 
   try {
     const db = getDb();
@@ -414,29 +448,87 @@ async function indexEvents(): Promise<void> {
     indexerLedgerLag.set(Math.max(0, currentLedger - lastProcessedLedger));
 
     if (currentLedger <= lastProcessedLedger) {
+      const durationMs = Date.now() - pollStartMs;
+      lastPollOutcome = "normal_empty";
+      lastPollDurationMs = durationMs;
+      indexerPollDurationMs.set(durationMs);
+      logger.debug(
+        {
+          pollCycleId: currentPollCycleId,
+          pollOutcome: "normal_empty",
+          pollDurationMs: durationMs,
+          indexedLedger: lastProcessedLedger,
+          latestLedger: currentLedger,
+        },
+        "indexer poll: no new ledgers (normal empty)",
+      );
       recordPollSuccess();
       return;
     }
 
+    // Detect restart-recovery scenario: the checkpoint cursor lags behind
+    // rows already present in stream_events (crash between row insert and
+    // cursor write). We probe by counting rows with ledger_sequence >
+    // lastProcessedLedger. A non-zero count means this poll will re-fetch
+    // events that are already in the DB — they will be silently deduped by
+    // INSERT OR IGNORE, but we log and count the dedup activity so operators
+    // can distinguish this from a normal empty or fresh poll.
+    let isRestartRecovery = false;
+    try {
+      const aheadRow = db
+        .prepare(
+          "SELECT COUNT(*) AS cnt FROM stream_events WHERE ledger_sequence > ?",
+        )
+        .get(lastProcessedLedger) as { cnt: number } | undefined;
+      if (aheadRow && aheadRow.cnt > 0) {
+        isRestartRecovery = true;
+        logger.info(
+          {
+            pollCycleId: currentPollCycleId,
+            existingRowsAheadOfCursor: aheadRow.cnt,
+            cursorLedger: lastProcessedLedger,
+            currentLedger,
+          },
+          "indexer restart-recovery: rows exist ahead of the persisted cursor — events will be re-fetched and deduped by INSERT OR IGNORE",
+        );
+      }
+    } catch {
+      // Non-fatal: if the probe query fails (e.g. table not yet created in
+      // tests), proceed normally without the recovery signal.
+    }
+
     if (isFallbackPollingEnabled()) {
-      await indexEventsWithFallback(db, currentLedger);
+      await indexEventsWithFallback(db, currentLedger, currentPollCycleId, isRestartRecovery);
     } else {
-      await indexEventsWithCursorPagination(db, currentLedger);
+      await indexEventsWithCursorPagination(db, currentLedger, currentPollCycleId, isRestartRecovery);
     }
 
     recordPollSuccess();
   } catch (err) {
+    const durationMs = Date.now() - pollStartMs;
+    lastPollOutcome = "rpc_error";
+    lastPollDurationMs = durationMs;
+    indexerPollDurationMs.set(durationMs);
     circuitBreaker.onFailure();
     lastFailureKind = classifyRpcFailure(err);
     indexerErrorsTotal.inc();
-    logger.error({ err }, "failed to index events");
+    logger.error(
+      {
+        pollCycleId: currentPollCycleId,
+        pollOutcome: "rpc_error",
+        pollDurationMs: durationMs,
+        failureKind: lastFailureKind,
+      },
+      "failed to index events",
+    );
   } finally {
     isIndexing = false;
   }
 }
 
-async function indexEventsWithFallback(db: any, currentLedger: number): Promise<void> {
+async function indexEventsWithFallback(db: any, currentLedger: number, currentPollCycleId: number, isRestartRecovery: boolean): Promise<void> {
   const startLedger = lastProcessedLedger + 1;
+  const pollStartMs = Date.now();
   let events;
 
   try {
@@ -450,18 +542,34 @@ async function indexEventsWithFallback(db: any, currentLedger: number): Promise<
       ],
     });
   } catch (err) {
-    logger.error({ err }, "RPC getEvents failed in fallback mode");
+    logger.error(
+      { pollCycleId: currentPollCycleId, err },
+      "RPC getEvents failed in fallback mode",
+    );
     throw err;
   }
 
   const startLedgerForMetrics = lastProcessedLedger;
   const eventCount = events.events?.length ?? 0;
+  let insertedCount = 0;
+  let dedupedCount = 0;
 
   if (eventCount > 0) {
     db.transaction(() => {
       for (const event of events.events || []) {
+        const changesBefore = db.prepare("SELECT changes() AS n").get() as { n: number } | undefined;
         processEvent(db, event);
-        eventsIndexedTotal.inc();
+        // `changes()` returns the number of rows modified by the most recent
+        // statement. A value of 0 after INSERT OR IGNORE means the row was
+        // already present (dedup hit).
+        const changesAfter = db.prepare("SELECT changes() AS n").get() as { n: number } | undefined;
+        if ((changesAfter?.n ?? 1) === 0) {
+          dedupedCount++;
+          indexerEventsDedupedTotal.inc();
+        } else {
+          insertedCount++;
+          eventsIndexedTotal.inc();
+        }
       }
     })();
   }
@@ -471,13 +579,41 @@ async function indexEventsWithFallback(db: any, currentLedger: number): Promise<
   lastIndexedLedger.set(lastProcessedLedger);
   indexerLedgerLag.set(Math.max(0, currentLedger - lastProcessedLedger));
   ledgersScannedTotal.inc(lastProcessedLedger - startLedgerForMetrics);
+
+  const durationMs = Date.now() - pollStartMs;
+  const outcome: IndexerPollOutcome =
+    isRestartRecovery
+      ? "restart_recovery"
+      : insertedCount > 0
+        ? "events_processed"
+        : "empty_range";
+  lastPollOutcome = outcome;
+  lastPollDurationMs = durationMs;
+  indexerPollDurationMs.set(durationMs);
+
+  logger.info(
+    {
+      pollCycleId: currentPollCycleId,
+      pollOutcome: outcome,
+      pollDurationMs: durationMs,
+      startLedger,
+      currentLedger,
+      eventsInserted: insertedCount,
+      eventsDeduped: dedupedCount,
+      isRestartRecovery,
+    },
+    "indexer poll completed (fallback mode)",
+  );
 }
 
-async function indexEventsWithCursorPagination(db: any, currentLedger: number): Promise<void> {
+async function indexEventsWithCursorPagination(db: any, currentLedger: number, currentPollCycleId: number, isRestartRecovery: boolean): Promise<void> {
   const startLedger = lastProcessedLedger + 1;
+  const pollStartMs = Date.now();
   let cursor: string | undefined;
   let maxLedgerSeen = lastProcessedLedger;
   const startLedgerForMetrics = lastProcessedLedger;
+  let totalInserted = 0;
+  let totalDeduped = 0;
 
   while (true) {
     let request: rpc.Api.GetEventsRequest;
@@ -509,7 +645,10 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number): 
     try {
       eventsResponse = await rpcServer!.getEvents(request);
     } catch (err) {
-      logger.error({ err }, "RPC getEvents failed during cursor pagination");
+      logger.error(
+        { pollCycleId: currentPollCycleId, cursor, err },
+        "RPC getEvents failed during cursor pagination",
+      );
       throw err;
     }
 
@@ -522,23 +661,52 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number): 
       }
 
       logger.warn(
-        { cursor, nextCursor },
+        { pollCycleId: currentPollCycleId, cursor, nextCursor },
         "RPC returned an empty page while pagination was still active; retrying with the remaining cursor",
       );
       cursor = nextCursor;
       continue;
     }
 
+    let pageInserted = 0;
+    let pageDeduped = 0;
+
     db.transaction(() => {
       for (const event of events) {
         processEvent(db, event);
-        eventsIndexedTotal.inc();
+        // Detect whether the row was actually inserted or silently skipped.
+        // `changes()` returns 0 when INSERT OR IGNORE finds a conflict.
+        const changes = db.prepare("SELECT changes() AS n").get() as { n: number } | undefined;
+        if ((changes?.n ?? 1) === 0) {
+          pageDeduped++;
+          indexerEventsDedupedTotal.inc();
+        } else {
+          pageInserted++;
+          eventsIndexedTotal.inc();
+        }
 
         if (event.ledger > maxLedgerSeen) {
           maxLedgerSeen = event.ledger;
         }
       }
     })();
+
+    totalInserted += pageInserted;
+    totalDeduped += pageDeduped;
+
+    if (pageDeduped > 0) {
+      logger.info(
+        {
+          pollCycleId: currentPollCycleId,
+          cursor,
+          pageEventsTotal: events.length,
+          pageInserted,
+          pageDeduped,
+          isRestartRecovery,
+        },
+        "indexer page: duplicate events silently skipped by INSERT OR IGNORE",
+      );
+    }
 
     cursor = nextCursor;
 
@@ -553,6 +721,32 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number): 
   lastIndexedLedger.set(lastProcessedLedger);
   indexerLedgerLag.set(Math.max(0, currentLedger - lastProcessedLedger));
   ledgersScannedTotal.inc(lastProcessedLedger - startLedgerForMetrics);
+
+  const durationMs = Date.now() - pollStartMs;
+  const outcome: IndexerPollOutcome =
+    isRestartRecovery
+      ? "restart_recovery"
+      : totalInserted > 0
+        ? "events_processed"
+        : "empty_range";
+  lastPollOutcome = outcome;
+  lastPollDurationMs = durationMs;
+  indexerPollDurationMs.set(durationMs);
+
+  logger.info(
+    {
+      pollCycleId: currentPollCycleId,
+      pollOutcome: outcome,
+      pollDurationMs: durationMs,
+      startLedger,
+      currentLedger,
+      checkpointLedger: checkpoint,
+      eventsInserted: totalInserted,
+      eventsDeduped: totalDeduped,
+      isRestartRecovery,
+    },
+    "indexer poll completed (cursor pagination)",
+  );
 }
 
 function processEvent(db: any, event: rpc.Api.EventResponse): void {

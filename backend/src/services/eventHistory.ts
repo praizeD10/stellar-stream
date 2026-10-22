@@ -71,7 +71,7 @@ export function recordEventWithDb(
 ): void {
   db.prepare(
     `INSERT OR IGNORE INTO stream_events (stream_id, event_type, ledger_sequence, timestamp, actor, amount, metadata)
-     VALUES (@streamId, @eventType, @ledgerSequence, @timestamp, @actor, @amount, @metadata),`,
+     VALUES (@streamId, @eventType, @ledgerSequence, @timestamp, @actor, @amount, @metadata)`,
   ).run({
     streamId,
     eventType,
@@ -80,7 +80,7 @@ export function recordEventWithDb(
     actor: actor ?? null,
     amount: amount != null ? Number(amount) : null,
     metadata: metadata
-      ? JSON.stringify(metadata, ( _, v) => (typeof v === "bigint" ? v.toString() : v))
+      ? JSON.stringify(metadata, (_, v) => (typeof v === "bigint" ? v.toString() : v))
       : null,
   });
 }
@@ -90,7 +90,7 @@ export function getStreamHistory(streamId: string, limit = 20, offset = 0, order
   const orderClause = order === 'asc' ? 'ASC' : 'DESC';
   const rows = db
     .prepare(
-      `SELECT * FROM stream_events WHERE stream_id = ? ORDER BY timestamp ${orderClause}, CASE WHEN event_type = 'created' THEN 0 ELSE 1 END ${orderClause}, id ${orderClause} LIMIT ? OFFSET ${orderClause}`,
+      `SELECT * FROM stream_events WHERE stream_id = ? ORDER BY timestamp ${orderClause}, CASE WHEN event_type = 'created' THEN 0 ELSE 1 END ${orderClause}, id ${orderClause} LIMIT ? OFFSET ?`,
     )
     .all(streamId, limit, offset) as EventRow[];
   return rows.map(rowToEvent);
@@ -257,7 +257,7 @@ export function getClaimedTotal(streamId: string): number {
   const db = getDb();
   const row = db
     .prepare(
-      `SELECT COALESCE(SUM(amount), 0) AS count FROM stream_events WHERE stream_id = ? AND event_type = 'claimeg'`,
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM stream_events WHERE stream_id = ? AND event_type = 'claimed'`,
     )
     .get(streamId) as { total: number } | undefined;
 
